@@ -1,34 +1,436 @@
-# Gradle files
-.gradle/
-build/
 
-# Local configuration file (sdk path, etc)
-local.properties
+# ================================
+# Enhanced MLP + Attention for Chlorophyll-a Prediction (Indian Ocean)
+# Using: SST, POC, SSH, MLD + Season + Spatial + Derived Features
+# Predict 2024 Chlorophyll-a with improved accuracy
+# ================================
 
-# Log/OS Files
-*.log
+import os
+import numpy as np
+import xarray as xr
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import RobustScaler
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, Dropout, LayerNormalization, Attention
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import EarlyStopping
+import matplotlib.pyplot as plt
+from tqdm import tqdm
 
-# Android Studio generated files and folders
-captures/
-.externalNativeBuild/
-.cxx/
-*.aab
-*.apk
-output-metadata.json
+# -------------------------------
+# CONFIGURATION
+# -------------------------------
+BASE_DIR = r"C:\remote sensing\papers of my paper2024\Indian ocean bassin thesis_2025\Actual_work\CNN_adapted_data"
+YEARS = [2005, 2010, 2015, 2020, 2024]
+SEASONS = ['summer', 'spring']
+TARGET_VAR = 'chlor_a'
 
-# IntelliJ
-*.iml
-.idea/
-misc.xml
-deploymentTargetDropDown.xml
-render.experimental.xml
+# Study region
+LON_MIN, LON_MAX = 45, 100
+LAT_MIN, LAT_MAX = 5, 25
 
-# Keystore files
-*.jks
-*.keystore
+# -------------------------------
+# HELPER FUNCTIONS
+# -------------------------------
+def standardize_coords(ds):
+    rename_map = {}
+    for coord in ds.coords:
+        c = coord.lower()
+        if c in {'lat', 'latitude', 'y', 'nav_lat', 'gphit'}:
+            rename_map[coord] = 'lat'
+        elif c in {'lon', 'longitude', 'x', 'nav_lon', 'glamt'}:
+            rename_map[coord] = 'lon'
+    if rename_map:
+        ds = ds.rename(rename_map)
+    if 'lat' in ds.dims and len(ds.lat) > 1 and ds.lat.values[0] > ds.lat.values[-1]:
+        ds = ds.reindex(lat=ds.lat[::-1])
+    return ds
 
-# Google Services (e.g. APIs or Firebase)
-google-services.json
+def find_main_variable(ds, keyword):
+    candidates = [v for v in ds.data_vars if keyword in v.lower()]
+    if candidates:
+        return candidates[0]
+    for v in ds.data_vars:
+        if set(ds[v].dims).issubset({'lat', 'lon', 'time', 'depth', 'lev'}):
+            return v
+    raise ValueError(f"No valid variable for '{keyword}'")
 
-# Android Profiling
-*.hprof
+def load_and_align(file_path, ref_grid=None):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found: {file_path}")
+    ds = xr.open_dataset(file_path).squeeze(drop=True)
+    ds = standardize_coords(ds)
+    ds = ds.sel(lat=slice(LAT_MIN, LAT_MAX), lon=slice(LON_MIN, LON_MAX))
+    if ref_grid is not None:
+        ds = ds.interp_like(ref_grid, method='nearest')
+    return ds
+
+def add_derived_features(df):
+    """Add oceanographic derived features"""
+    df = df.copy()
+    
+    # Seasonal dummies
+    df['season_spring'] = (df['season'] == 'spring').astype(int)
+    df['season_summer'] = (df['season'] == 'summer').astype(int)
+    
+    # Spatial normalization
+    df['lat_norm'] = (df['lat'] - df['lat'].mean()) / df['lat'].std()
+    df['lon_norm'] = (df['lon'] - df['lon'].mean()) / df['lon'].std()
+    
+    # Derived oceanographic ratios
+    if 'sst' in df.columns and 'mld' in df.columns:
+        df['sst_mld_ratio'] = df['sst'] / (df['mld'] + 1e-6)
+    if 'poc' in df.columns and 'sst' in df.columns:
+        df['poc_sst_ratio'] = df['poc'] / (df['sst'] + 1e-6)
+    if 'ssh' in df.columns and 'mld' in df.columns:
+        df['ssh_mld_ratio'] = df['ssh'] / (df['mld'] + 1e-6)
+    
+    # Squared terms for non-linear relationships
+    for col in ['sst', 'poc', 'ssh', 'mld']:
+        if col in df.columns:
+            df[f'{col}_squared'] = df[col] ** 2
+    
+    return df
+
+# -------------------------------
+# DATA LOADING
+# -------------------------------
+print("📥 Loading datasets with enhanced features...")
+
+all_records = []
+actual_2024_datasets = {}
+
+for season in tqdm(SEASONS, desc="Seasons"):
+    season_dir = os.path.join(BASE_DIR, season)
+    if not os.path.isdir(season_dir):
+        print(f"⚠️ Season folder missing: {season_dir}")
+        continue
+
+    for year in tqdm(YEARS, desc=f"  {season}", leave=False):
+        try:
+            # Load target
+            chla_paths = [
+                os.path.join(season_dir, f"chlor_a_{season}_{year}.nc"),
+                os.path.join(season_dir, f"chla_{season}_{year}.nc")
+            ]
+            chla_path = next((p for p in chla_paths if os.path.exists(p)), None)
+            if not chla_path:
+                continue
+
+            chla_ds = load_and_align(chla_path)
+            chla_var = find_main_variable(chla_ds, 'chlor')
+            chla_ref = chla_ds[chla_var]
+
+            if year == 2024:
+                actual_2024_datasets[season] = chla_ref
+
+            aligned = xr.Dataset({'chlor_a': chla_ref})
+
+            # Load predictors
+            for var_key in ['sst', 'poc', 'ssh', 'mld']:
+                var_path = os.path.join(season_dir, f"{var_key}_{season}_{year}.nc")
+                
+                # Handle missing MLD in 2020
+                if var_key == 'mld' and year == 2020 and not os.path.exists(var_path):
+                    fallback_path = os.path.join(season_dir, f"mld_{season}_2024.nc")
+                    if os.path.exists(fallback_path):
+                        var_path = fallback_path
+                    else:
+                        continue
+
+                if not os.path.exists(var_path):
+                    continue
+
+                try:
+                    var_ds = load_and_align(var_path, ref_grid=chla_ref)
+                    var_name = find_main_variable(var_ds, var_key)
+                    aligned[var_key] = var_ds[var_name]
+                except Exception:
+                    continue
+
+            # Convert to DataFrame
+            df = aligned.to_dataframe().reset_index()
+            required = ['chlor_a'] + [p for p in ['sst', 'poc', 'ssh', 'mld'] if p in aligned.data_vars]
+            df = df.dropna(subset=required)
+
+            if not df.empty:
+                df['year'] = year
+                df['season'] = season
+                all_records.append(df)
+
+        except Exception as e:
+            print(f"❌ Error in {season} {year}: {e}")
+
+if not all_records:
+    raise RuntimeError("No data loaded!")
+
+df_master = pd.concat(all_records, ignore_index=True)
+print(f"✅ Loaded {len(df_master)} samples across {df_master['year'].nunique()} years")
+
+# Add derived features
+df_master = add_derived_features(df_master)
+
+# Define all available features (including derived)
+base_predictors = ['sst', 'poc', 'ssh', 'mld']
+spatial_seasonal = ['season_spring', 'season_summer', 'lat_norm', 'lon_norm']
+derived_features = ['sst_mld_ratio', 'poc_sst_ratio', 'ssh_mld_ratio', 
+                   'sst_squared', 'poc_squared', 'ssh_squared', 'mld_squared']
+
+all_features = [f for f in base_predictors + spatial_seasonal + derived_features if f in df_master.columns]
+print(f"✅ Using {len(all_features)} features: {all_features}")
+
+# -------------------------------
+# PREPARE DATA WITH TIME-BASED SPLIT
+# -------------------------------
+# Train on 2005, 2010, 2015 → Validate on 2020 → Predict 2024
+train_years = [2005, 2010, 2015]
+val_year = 2020
+
+train_data = df_master[df_master['year'].isin(train_years)]
+val_data = df_master[df_master['year'] == val_year]
+predict_data = df_master[df_master['year'] == 2024]
+
+if val_data.empty or predict_data.empty:
+    raise ValueError("Validation or prediction data missing!")
+
+X_train = train_data[all_features].values.astype(np.float32)
+y_train = train_data['chlor_a'].values.astype(np.float32)
+X_val = val_data[all_features].values.astype(np.float32)
+y_val = val_data['chlor_a'].values.astype(np.float32)
+X_2024 = predict_data[all_features].values.astype(np.float32)
+
+# Use RobustScaler for better outlier handling
+scaler = RobustScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_val_scaled = scaler.transform(X_val)
+X_2024_scaled = scaler.transform(X_2024)
+
+# -------------------------------
+# BUILD MLP + ATTENTION MODEL
+# -------------------------------
+print("\n🎯 Building MLP + Attention model...")
+
+inputs = Input(shape=(len(all_features),))
+
+# Dense layers with normalization
+x = Dense(512, activation='relu')(inputs)
+x = LayerNormalization()(x)
+x = Dropout(0.3)(x)
+
+x = Dense(256, activation='relu')(x)
+x = LayerNormalization()(x)
+x = Dropout(0.3)(x)
+
+x = Dense(128, activation='relu')(x)
+x = LayerNormalization()(x)
+x = Dropout(0.2)(x)
+
+# Attention mechanism
+attention_weights = Dense(len(all_features), activation='softmax')(x)
+attended_features = inputs * attention_weights  # Element-wise multiplication
+attended_features = Dense(64, activation='relu')(attended_features)
+
+# Final dense layers
+x = Dense(64, activation='relu')(attended_features)
+x = Dropout(0.2)(x)
+outputs = Dense(1)(x)
+
+model = Model(inputs, outputs)
+model.compile(optimizer=Adam(learning_rate=0.0005), loss='mse', metrics=['mae'])
+
+# Train with early stopping
+history = model.fit(
+    X_train_scaled, y_train,
+    validation_data=(X_val_scaled, y_val),
+    epochs=2,
+    batch_size=64,
+    callbacks=[EarlyStopping(monitor='val_loss', patience=15, restore_best_weights=True)],
+    verbose=1
+)
+
+# -------------------------------
+# PLOTTING: TRAINING HISTORY
+# -------------------------------
+plt.figure(figsize=(12, 4))
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Train Loss', linewidth=2)
+plt.plot(history.history['val_loss'], label='Val Loss', linewidth=2)
+plt.title('Model Training (MSE)', fontsize=12)
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['mae'], label='Train MAE', linewidth=2)
+plt.plot(history.history['val_mae'], label='Val MAE', linewidth=2)
+plt.title('Model MAE', fontsize=12)
+plt.xlabel('Epoch')
+plt.ylabel('MAE')
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+# -------------------------------
+# EVALUATE & PREDICT
+# -------------------------------
+y_val_pred = model.predict(X_val_scaled).flatten()
+r2_val = r2_score(y_val, y_val_pred)
+mae_val = mean_absolute_error(y_val, y_val_pred)
+rmse_val = np.sqrt(mean_squared_error(y_val, y_val_pred))
+
+print(f"\n🔍 Validation Performance (2020):")
+print(f"   R²  : {r2_val:.4f}")
+print(f"   MAE : {mae_val:.4f}")
+print(f"   RMSE: {rmse_val:.4f}")
+
+# Predict 2024
+y_2024_pred = model.predict(X_2024_scaled).flatten()
+
+# Get actual 2024 values if available
+y_2024_true = predict_data['chlor_a'].values if 'chlor_a' in predict_data.columns else None
+
+if y_2024_true is not None:
+    r2_2024 = r2_score(y_2024_true, y_2024_pred)
+    mae_2024 = mean_absolute_error(y_2024_true, y_2024_pred)
+    rmse_2024 = np.sqrt(mean_squared_error(y_2024_true, y_2024_pred))
+    
+    print(f"\n🎯 2024 Prediction Performance:")
+    print(f"   R²  : {r2_2024:.4f}")
+    print(f"   MAE : {mae_2024:.4f}")
+    print(f"   RMSE: {rmse_2024:.4f}")
+    
+    # Enhanced scatter plot
+    plt.figure(figsize=(10, 8))
+    plt.scatter(y_2024_true, y_2024_pred, alpha=0.6, s=30, edgecolors='black', linewidth=0.5)
+    min_val = min(y_2024_true.min(), y_2024_pred.min())
+    max_val = max(y_2024_true.max(), y_2024_pred.max())
+    plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2, label='Perfect Prediction')
+    plt.xlabel('Observed Chlorophyll-a (2024) [mg/m³]', fontsize=12)
+    plt.ylabel('Predicted Chlorophyll-a (2024) [mg/m³]', fontsize=12)
+    plt.title(f'2024: Observed vs Predicted Chlorophyll-a\nR² = {r2_2024:.3f}, MAE = {mae_2024:.3f}', fontsize=14)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+    
+    # Residuals plot
+    residuals = y_2024_true - y_2024_pred
+    plt.figure(figsize=(10, 6))
+    plt.scatter(y_2024_true, residuals, alpha=0.6, s=30)
+    plt.axhline(0, color='red', linestyle='--', linewidth=2, label='Zero Bias')
+    plt.xlabel('Observed Chlorophyll-a (2024) [mg/m³]', fontsize=12)
+    plt.ylabel('Residuals (Observed - Predicted) [mg/m³]', fontsize=12)
+    plt.title('Residual Plot (2024 Predictions)', fontsize=14)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+else:
+    print(f"\n🌊 Predicted 2024 chlor_a (mean): {np.mean(y_2024_pred):.4f} mg/m³")
+
+# -------------------------------
+# SAVE & PLOT SPATIAL MAPS
+# -------------------------------
+df_pred = predict_data[['lat', 'lon', 'season']].copy()
+df_pred['chlor_a_pred'] = y_2024_pred
+
+for season in SEASONS:
+    df_season = df_pred[df_pred['season'] == season]
+    if df_season.empty:
+        continue
+        
+    # Create spatial grid
+    lat_unique = np.sort(df_season['lat'].unique())
+    lon_unique = np.sort(df_season['lon'].unique())
+    grid = np.full((len(lat_unique), len(lon_unique)), np.nan)
+    
+    lat_idx = {v: i for i, v in enumerate(lat_unique)}
+    lon_idx = {v: i for i, v in enumerate(lon_unique)}
+    
+    for _, row in df_season.iterrows():
+        i = lat_idx[row['lat']]
+        j = lon_idx[row['lon']]
+        grid[i, j] = row['chlor_a_pred']
+    
+    da_pred = xr.DataArray(
+        grid,
+        dims=['lat', 'lon'],
+        coords={'lat': lat_unique, 'lon': lon_unique},
+        name='chlor_a_predicted'
+    )
+    
+    pred_path = os.path.join(BASE_DIR, f"chlor_a_predicted_2024_{season}.nc")
+    da_pred.to_netcdf(pred_path)
+    print(f"💾 Predicted {season} saved to: {pred_path}")
+
+    # Plot predicted
+    plt.figure(figsize=(12, 5))
+    im = da_pred.plot(cmap='viridis', robust=True, cbar_kwargs={'label': 'Chlorophyll-a (mg/m³)', 'shrink': 0.8})
+    plt.title(f'Predicted Chlorophyll-a — {season.title()} 2024', fontsize=14, pad=20)
+    plt.xlabel('Longitude', fontsize=12)
+    plt.ylabel('Latitude', fontsize=12)
+    plt.tight_layout()
+    plt.show()
+
+    # Plot observed (if available)
+    if season in actual_2024_datasets:
+        da_obs = actual_2024_datasets[season]
+        plt.figure(figsize=(12, 5))
+        im = da_obs.plot(cmap='viridis', robust=True, cbar_kwargs={'label': 'Chlorophyll-a (mg/m³)', 'shrink': 0.8})
+        plt.title(f'Observed Chlorophyll-a — {season.title()} 2024', fontsize=14, pad=20)
+        plt.xlabel('Longitude', fontsize=12)
+        plt.ylabel('Latitude', fontsize=12)
+        plt.tight_layout()
+        plt.show()
+
+# -------------------------------
+# DIFFERENCE MAPS
+# -------------------------------
+if y_2024_true is not None:
+    print("\n📊 Generating difference maps...")
+    for season in SEASONS:
+        if season not in actual_2024_datasets:
+            continue
+            
+        da_obs = actual_2024_datasets[season]
+        
+        df_season = df_pred[df_pred['season'] == season]
+        if df_season.empty:
+            continue
+            
+        lat_unique = np.sort(df_season['lat'].unique())
+        lon_unique = np.sort(df_season['lon'].unique())
+        pred_grid = np.full((len(lat_unique), len(lon_unique)), np.nan)
+        
+        lat_idx = {v: i for i, v in enumerate(lat_unique)}
+        lon_idx = {v: i for i, v in enumerate(lon_unique)}
+        
+        for _, row in df_season.iterrows():
+            i = lat_idx[row['lat']]
+            j = lon_idx[row['lon']]
+            pred_grid[i, j] = row['chlor_a_pred']
+        
+        da_pred = xr.DataArray(
+            pred_grid,
+            dims=['lat', 'lon'],
+            coords={'lat': lat_unique, 'lon': lon_unique}
+        )
+        
+        da_obs_aligned = da_obs.interp_like(da_pred, method='nearest')
+        difference = da_obs_aligned - da_pred
+        
+        plt.figure(figsize=(12, 5))
+        im = difference.plot(cmap='RdBu_r', center=0, cbar_kwargs={'label': 'Difference (Obs - Pred) [mg/m³]', 'shrink': 0.8})
+        plt.title(f'Difference Map — {season.title()} 2024', fontsize=14, pad=20)
+        plt.xlabel('Longitude', fontsize=12)
+        plt.ylabel('Latitude', fontsize=12)
+        plt.tight_layout()
+        plt.show()
+
+print("\n🎉 Enhanced model training and prediction complete!")
