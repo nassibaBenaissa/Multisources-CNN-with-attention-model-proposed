@@ -73,3 +73,43 @@ class DifferentiableNPZ(nn.Module):
         dZdt =  assimilation - mort_Z + diff_Z
         
         return dNdt, dPdt, dZZ
+
+
+
+# Temporelle Intégration & Différentiability Demonstration 
+
+
+        def rk4_step(model, state, t, dt):
+    """RK4 différentiable natif PyTorch (évite dépendances externes)"""
+    k1 = model(t, state)
+    k2 = model(t + dt/2, [s + dt/2 * k for s, k in zip(state, k1)])
+    k3 = model(t + dt/2, [s + dt/2 * k for s, k in zip(state, k2)])
+    k4 = model(t + dt,     [s + dt * k for s, k in zip(state, k3)])
+    return [s + dt/6 * (k1[i] + 2*k2[i] + 2*k3[i] + k4[i]) for i, s in enumerate(state)]
+
+# ---------------- EXEMPLE D'UTILISATION ----------------
+nz = 20  # couches verticales
+dz = 5.0 # m
+dt = 3600.0 # 1h en secondes
+steps = 24
+
+model = DifferentiableNPZ(dz=dz, mu_max=0.6, k_N=0.8, g=0.5, Kz=2e-4)
+
+# Conditions initiales (forme nz)
+N0 = torch.full((nz,), 8.0, requires_grad=True)
+P0 = torch.full((nz,), 0.5)
+P0[10] = 2.0  # pic subsurface
+Z0 = torch.full((nz,), 0.3)
+state = (N0, P0, Z0)
+
+# Forward pass différentiable
+state_t = state
+for _ in range(steps):
+    state_t = rk4_step(model, state_t, t=0.0, dt=dt)
+
+# Vérification de la différentiabilité
+loss = state_t[1].sum()  # ex: biomasse phytoplanctonique totale
+loss.backward()
+
+print("Grad mu_max :", model.mu_max.grad)
+print("Grad Kz     :", model.Kz.grad)
