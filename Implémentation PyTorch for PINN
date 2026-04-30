@@ -1,0 +1,75 @@
+import torch
+import torch.nn as nn
+
+class DifferentiableNPZ(nn.Module):
+    """
+    Modèle NPZ 1D vertical entièrement différentiable.
+    
+    Processus implémentés :
+    - Limitation par les nutriments : Michaelis-Menten [1,2] , [1] Michaelis & Menten (1913) Biochem. Z. ; Dugdale (1967) J. Mar. Res. 25:213-228, [2] Fasham, Ducklow & McKelvie (1990) J. Mar. Res. 48:591-639
+    - Broutage zooplanctonique : terme g·P·Z [3] , [3] Evans & Parslow (1985) Deep-Sea Res. 32:1073-1095 ; Franks et al. (1986) J. Mar. Res. 44:113-138
+    - Diffusion turbulente verticale : Kz·∂²C/∂z² [4] , [4] Chen et al. (2018) NeurIPS (Neural ODE) ; Raissi et al. (2019) J. Comput. Phys. (PINN)
+    
+    Références bibliographiques intégrées dans les commentaires.
+    """
+    def __init__(
+        self,
+        dz: float = 1.0,
+        mu_max: float = 0.8,
+        k_N: float = 0.5,
+        g: float = 0.6,
+        gamma: float = 0.7,
+        m_P: float = 0.1,
+        m_Z: float = 0.15,
+        Kz: float = 1e-4
+    ):
+        super().__init__()
+        self.dz = dz
+        # Paramètres déclarés comme nn.Parameter pour optimisation par gradient
+        self.mu_max = nn.Parameter(torch.tensor(mu_max))
+        self.k_N    = nn.Parameter(torch.tensor(k_N))
+        self.g      = nn.Parameter(torch.tensor(g))
+        self.gamma  = nn.Parameter(torch.tensor(gamma))
+        self.m_P    = nn.Parameter(torch.tensor(m_P))
+        self.m_Z    = nn.Parameter(torch.tensor(m_Z))
+        self.Kz     = nn.Parameter(torch.tensor(Kz))
+
+    def laplacian(self, C: torch.Tensor) -> torch.Tensor:
+        """
+        Diffusion verticale Kz·∂²C/∂z² via différences finies centrées.
+        Conditions aux limites : flux nul (Neumann homogène) aux parois.
+        """
+        d2C = torch.zeros_like(C)
+        # Intérieur : schéma centré d'ordre 2
+        d2C[1:-1] = (C[2:] - 2*C[1:-1] + C[:-2]) / self.dz**2
+        # Bords : approximation Neumann ∂C/∂z ≈ 0
+        d2C[0]    = (C[1] - C[0]) / self.dz**2
+        d2C[-1]   = (C[-2] - C[-1]) / self.dz**2
+        return d2C
+
+    def forward(self, t: float, state: tuple[torch.Tensor, ...]):
+        N, P, Z = state  # tenseurs de forme (nz,) ou (batch, nz)
+        
+        # 1. Limitation nutritive Michaelis-Menten [1,2]
+        mu = self.mu_max * (N / (self.k_N + N + 1e-9))
+        
+        # 2. Broutage gZ [3]
+        grazing = self.g * P * Z
+        assimilation = self.gamma * grazing
+        excretion    = (1.0 - self.gamma) * grazing
+        
+        # 3. Mortalités linéaires
+        mort_P = self.m_P * P
+        mort_Z = self.m_Z * Z
+        
+        # 4. Diffusion turbulente Kz [4]
+        diff_N = self.Kz * self.laplacian(N)
+        diff_P = self.Kz * self.laplacian(P)
+        diff_Z = self.Kz * self.laplacian(Z)
+        
+        # Bilans différentiables
+        dNdt = -mu*P + excretion + mort_P + mort_Z + diff_N
+        dPdt =  mu*P - grazing - mort_P + diff_P
+        dZdt =  assimilation - mort_Z + diff_Z
+        
+        return dNdt, dPdt, dZZ
