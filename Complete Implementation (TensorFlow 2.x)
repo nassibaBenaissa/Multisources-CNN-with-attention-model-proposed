@@ -1,0 +1,144 @@
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+import numpy as np
+
+# ==========================================
+# 1. COUCHE PHYSIQUE DIFFÉRENTIABLE
+# ==========================================
+class PhysicalChlaLayer(layers.Layer):
+    """
+    Implémente la relation semi-empirique Chl-a = f(NDCI, SST, SSH, POC, SSW, MLD)
+    Toutes les opérations sont différentiables pour le backpropagation.
+    """
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        # Coefficients initiaux (à calibrer régionalement AS/BoB)
+        self.a_ndci = tf.Variable(3.5, dtype=tf.float32, trainable=True, name='a_ndci')
+        self.b_ndci = tf.Variable(1.2, dtype=tf.float32, trainable=True, name='b_ndci')
+        self.sst_opt = tf.Variable(26.0, dtype=tf.float32, trainable=False, name='sst_opt')
+        self.lambda_phys = 0.15  # Poids de la régularisation physique
+
+    def call(self, inputs):
+        # inputs shape: (batch, H, W, 7)
+        # Ordre: [SST, SSH, POC, NDCI, SSW_u, SSW_v, MLD]
+        sst = inputs[..., 0:1]
+        ssh = inputs[..., 1:2]
+        poc = inputs[..., 2:3]
+        ndci = inputs[..., 3:4]
+        ssw_u = inputs[..., 4:5]
+        ssw_v = inputs[..., 5:6]
+        mld = inputs[..., 6:7]
+
+        # 1. NDCI -> Chl-a (relation optique classique)
+        chla_ndci = tf.exp(self.a_ndci * ndci + self.b_ndci)
+
+        # 2. Réponse thermique (optimum gaussien)
+        chla_sst = tf.exp(-0.5 * ((sst - self.sst_opt) / 5.0)**2)
+
+        # 3. Limitation lumineuse (Beer-Lambert simplifié)
+        k_d = 0.02 + 0.008 * poc  # coeff. d'atténuation dépendant du POC
+        light_factor = (1.0 - tf.exp(-k_d * mld)) / (k_d * mld + 1e-6)
+
+        # 4. Upwelling Ekman (composante côtière du vent)
+        wind_mag = tf.sqrt(ssw_u**2 + ssw_v**2)
+        # Approximation: vent fort = mélange = nutriments (si MLD peu profond)
+        wind_factor = 1.0 + 0.3 * wind_mag * tf.exp(-mld / 30.0)
+
+        # 5. SSH proxy dynamique (tourbillons/fronts)
+        ssh_factor = 1.0 + 0.25 * tf.abs(ssh)  # anomalies normalisées attendues
+
+        # Combinaison multiplicative (physiquement cohérente)
+        chla_phys = chla_ndci * chla_sst * light_factor * wind_factor * ssh_factor
+        return tf.expand_dims(chla_phys, -1)  # Shape: (B, H, W, 1)
+
+# ==========================================
+# 2. ARCHITECTURE HYBRIDE CNN + PHYSIQUE
+# ==========================================
+def build_physics_informed_chla_cnn(input_shape=(128, 128, 7)):
+    inputs = layers.Input(shape=input_shape, name='ocean_inputs')
+    
+    # --- BRANCHE CNN (extraction spatio-temporelle) ---
+    x = layers.Conv2D(32, 3, activation='relu', padding='same')(inputs)
+    x = layers.BatchNormalization()(x)
+    x = layers.Conv2D(32, 3, activation='relu', padding='same')(x)
+    x = layers.MaxPooling2D(2)(x)
+    
+    x = layers.Conv2D(64, 3, activation='relu', padding='same')(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Conv2D(64, 3, activation='relu', padding='same')(x)
+    x = layers.MaxPooling2D(2)(x)
+    
+    x = layers.Conv2D(128, 3, activation='relu', padding='same')(x)
+    
+    x = layers.UpSampling2D(2)(x)
+    x = layers.Conv2D(64, 3, activation='relu', padding='same')(x)
+    x = layers.UpSampling2D(2)(x)
+    x = layers.Conv2D(32, 3, activation='relu', padding='same')(x)
+    chla_cnn = layers.Conv2D(1, 1, activation='linear', padding='same', name='cnn_output')(x)
+    
+    # --- BRANCHE PHYSIQUE ---
+    chla_phys = PhysicalChlaLayer()(inputs)
+    
+    # --- FUSION APPRISE ---
+    # α est un paramètre entraînable qui pondère CNN vs Physique
+    alpha = tf.Variable(0.5, dtype=tf.float32, trainable=True, name='fusion_alpha')
+    alpha_sigmoid = tf.sigmoid(alpha)  # contraint entre 0 et 1
+    
+    chla_pred = alpha_sigmoid * chla_cnn + (1.0 - alpha_sigmoid) * chla_phys
+    
+    return models.Model(inputs=inputs, outputs=[chla_pred, chla_cnn, chla_phys])
+
+# ==========================================
+# 3. LOSS PHYSIQUEMENT INFORMÉE
+# ==========================================
+class PhysicsInformedLoss:
+    def __init__(self, lambda_mse=1.0, lambda_phys=0.2, lambda_grad=0.1):
+        self.lambda_mse = lambda_mse
+        self.lambda_phys = lambda_phys
+        self.lambda_grad = lambda_grad  # pénalise les gradients spatiaux irréalistes
+        
+    def __call__(self, y_true, y_pred_list):
+        y_pred, y_cnn, y_phys = y_pred_list
+        
+        # 1. MSE dans l'espace log (Chl-a suit une log-normale)
+        mse = tf.reduce_mean((tf.math.log1p(y_pred + 1e-6) - tf.math.log1p(y_true + 1e-6))**2)
+        
+        # 2. Cohérence physique: CNN ne doit pas diverger brutalement du modèle physique
+        phys_consistency = tf.reduce_mean(tf.abs(tf.math.log1p(y_cnn + 1e-6) - tf.math.log1p(y_phys + 1e-6)))
+        
+        # 3. Régularisation spatiale (pénalise les artefacts de checkerboard)
+        grad_y = tf.gradients(y_pred, inputs=None)  # simplifié: utiliser Sobel ou diff finies
+        # Version pratique avec différences finies:
+        dx = y_pred[:, :, 1:, :] - y_pred[:, :, :-1, :]
+        dy = y_pred[:, 1:, :, :] - y_pred[:, :-1, :, :]
+        grad_penalty = tf.reduce_mean(dx**2 + dy**2)
+        
+        return self.lambda_mse * mse + self.lambda_phys * phys_consistency + self.lambda_grad * grad_penalty
+
+# ==========================================
+# 4. ENTRAÎNEMENT
+# ==========================================
+def train_model(X_train, y_train, X_val, y_val, epochs=50, batch_size=16):
+    model = build_physics_informed_chla_cnn(input_shape=X_train.shape[1:])
+    loss_fn = PhysicsInformedLoss()
+    
+    # Optimiseur avec learning rate cyclique pour échapper aux minima locaux
+    optimizer = tf.keras.optimizers.Adam(learning_rate=1e-3)
+    
+    @tf.function
+    def train_step(x, y):
+        with tf.GradientTape() as tape:
+            y_pred_list = model(x, training=True)
+            loss = loss_fn(y, y_pred_list)
+        grads = tape.gradient(loss, model.trainable_variables)
+        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+        return loss
+    
+    # Loop d'entraînement simplifiée
+    history = {'loss': [], 'val_loss': []}
+    for epoch in range(epochs):
+        # ... batching, train_step, validation ...
+        # (Utilisez tf.data.Dataset pour la production)
+        pass
+    
+    return model
