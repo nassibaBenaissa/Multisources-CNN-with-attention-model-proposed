@@ -1,6 +1,6 @@
-# Physics-Informed Neural Network (PINN) for Drug Concentration
+# Physics-Informed Neural Network (PINN) for Remote Sensing (RS) data
 
-A simple PyTorch implementation of a Physics-Informed Neural Network (PINN) to solve a first-order pharmacokinetic ODE. This project demonstrates how to enforce physical laws (differential equations) directly into the loss function of a neural network.
+It consist on implementation of an uncertainty-aware, multi-modal 3D Convolutional Neural Network with spatial-channel attention to reconstruct high-resolution (30 m) Chlorophyll-a (Chl-a) fields in the Northern Indian Ocean. This project demonstrates how to enforce biophysical oceanographic constraints directly into the loss function of a neural network.
 
 <p align="center">
   <img src="workflow.png" width="100%">
@@ -8,43 +8,26 @@ A simple PyTorch implementation of a Physics-Informed Neural Network (PINN) to s
 
 ## Problem Setup
 
-We model the concentration of a drug in the bloodstream, $C(t)$, which decays over time following a simple first-order differential equation:
+We model the euphotic-zone Chlorophyll-a concentration, $C(\mathbf{x}, z)$, by fusing multi-sensor surface predictors (Landsat NDCI, MODIS SST/POC, Copernicus SSH) with subsurface physical constraints (Argo MLD, ILD). The semi-empirical Chl-a estimation integrates optical, thermal, light-attenuation, dynamical, and wind-driven processes:
 
 $$
-\frac{dC}{dt} = -kC
+C_{\text{phys}} = C_{\text{opt}} \cdot f^T(\text{SST}) \cdot f^{\text{Light}}(\text{MLD, POC}) \cdot f^{\text{upw}}(\text{SSH}) \cdot f^{\text{wind}}(\text{SSW, MLD})
 $$
-
-Subject to the initial condition:
-
-$$
-C(0) = C_0
-$$ 
 
 Where:
-- $C(t)$ is the drug concentration at time $t$.
-- $k$ is the elimination rate constant.
-- $C_0$ is the initial concentration.
+- Optical proxy: $C_{\text{opt}} = A \cdot \exp(B \cdot \text{NDCI})$
+- Thermal limitation: $f^T = \exp\left[-\frac{(\text{SST} - T_{\text{opt}})^2}{2\sigma_T^2}\right]$
+- Light availability: $f^{\text{Light}} = \frac{1 - \exp(-k_d \cdot \text{MLD})}{k_d \cdot \text{MLD}}, \quad k_d = k_w + k_p \cdot \text{POC}$
+- Mesoscale enhancement: $f^{\text{upw}} = 1 + \delta \cdot |\text{SSH}_{\text{anom}}|$
+- Wind mixing: $f^{\text{wind}} = 1 + \gamma \cdot |\text{SSW}| \cdot \exp(-\text{MLD}/H_0)$
 
-Instead of training purely on data points, the neural network $NN(t; \theta)$ minimizes a composite loss function:
-1. **Boundary Loss**: Ensures $NN(0) \approx C_0$.
-2. **Physics Loss**: Enforces the residual $\left( \frac{dNN}{dt} + k \cdot NN \right)^2 \approx 0$ across the time domain using automatic differentiation.
+Instead of training purely on data points, the neural network $NN(\mathbf{X}; \theta)$ minimizes a composite loss function:
+1. **Data Loss ($L_{\text{MSE}}$)**: Minimizes mean squared error against interpolated in-situ Argo fluorescence profiles and satellite-derived surface Chl-a.
+2. **Physics Loss ($L_{\text{phy}}$)**: Enforces biophysical constraints: (i) non-negative Chl-a predictions, (ii) upper bound on Chl-a/POC ratio ($\alpha = 0.3$) to prevent overestimation in turbid Case-II waters, and (iii) negative SST-Chl-a coupling in oligotrophic stratified zones. The total loss is $L_{\text{total}} = L_{\text{MSE}} + \lambda L_{\text{phy}}$ ($\lambda = 0.2$).
 
 ## Usage
 
-Run the standalone script to train the model and generate the loss plot and concentration animation:
+Run the standalone training script to reconstruct daily 30m 3D Chl-a fields with Monte Carlo dropout uncertainty quantification:
 
 ```bash
-python drug_pinn.py
-```
-
-This will produce:
-- `drug_pinn_concentration.gif`: An animation of the learned solution.
-- `drug_pinn_loss.png`: The training loss history.
-
-## References
-
-For more reading, see:
-> Raissi, M., Perdikaris, P., & Karniadakis, G. E. (2019). **Physics-informed neural networks: A deep learning framework for solving forward and inverse problems involving nonlinear partial differential equations**. *Journal of Computational Physics*, 378, 686–707.
-
----
-*Created by Zara Darcy and assisted by Cursor AI.*
+python nio_pinn_train.py
