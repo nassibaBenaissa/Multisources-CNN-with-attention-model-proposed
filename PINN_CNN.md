@@ -6,6 +6,8 @@ It consist on implementation of an uncertainty-aware, multi-modal 3D Convolution
 <p align="center">
   <img src="flowshart_CNN.jpg" width="100%">
 </p>
+
+See below the flowchart detailed in part_1 and part_2:
  Physics-Informed Neural Network (MS-CNN) (Summarized: part_1)
 <p align="center">
   <img src="flowshart_CNN_1.jpg" width="100%">
