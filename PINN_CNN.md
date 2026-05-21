@@ -2,12 +2,12 @@
 
 It consist on implementation of an uncertainty-aware, multi-modal 3D Convolutional Neural Network with spatial-channel attention to reconstruct high-resolution (30 m) Chlorophyll-a (Chl-a) fields in the Northern Indian Ocean. This project demonstrates how to enforce biophysical oceanographic constraints directly into the loss function of a neural network.
 
-##Physics-Informed Neural Network (MS-CNN) (Summarized)
+## Physics-Informed Neural Network (MS-CNN) (Summarized)
 <p align="center">
   <img src="flowshart_CNN.jpg" width="100%">
 </p>
 
-##Physics-Informed Neural Network (PINN) (for Oceanography Prediction)
+## pPhysics-Informed Neural Network (PINN) (for Oceanography Prediction)
 <p align="center">
   <img src="flowshart_CNN_PINN.png" width="100%">
 </p>
