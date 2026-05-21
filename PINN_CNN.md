@@ -7,7 +7,7 @@ It consist on implementation of an uncertainty-aware, multi-modal 3D Convolution
   <img src="flowshart_CNN.jpg" width="100%">
 </p>
 
-## pPhysics-Informed Neural Network (PINN) (for Oceanography Prediction)
+## Physics-Informed Neural Network (PINN) (for Oceanography Prediction)
 <p align="center">
   <img src="flowshart_CNN_PINN.png" width="100%">
 </p>
