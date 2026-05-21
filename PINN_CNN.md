@@ -10,9 +10,11 @@ It consist on implementation of an uncertainty-aware, multi-modal 3D Convolution
 
 We model the euphotic-zone Chlorophyll-a concentration, $C(\mathbf{x}, z)$, by fusing multi-sensor surface predictors (Landsat NDCI, MODIS SST/POC, Copernicus SSH) with subsurface physical constraints (Argo MLD, ILD). The semi-empirical Chl-a estimation integrates optical, thermal, light-attenuation, dynamical, and wind-driven processes:
 
-$$
-C_{\text{phys}} = C_{\text{opt}} \cdot f^T(\text{SST}) \cdot f^{\text{Light}}(\text{MLD, POC}) \cdot f^{\text{upw}}(\text{SSH}) \cdot f^{\text{wind}}(\text{SSW, MLD})
-$$
+
+
+ $$\text{Chl-a}_{\text{phy}}^{\text{2D}} = A \cdot \exp(B \cdot \text{NDCI}) \cdot f^{T}(\text{SST}) \cdot f^{\text{POC}} \cdot f^{\text{upw}}(\text{SSH}) \cdot f^{\text{wind}}(\text{SSW})$$
+
+ $$\text{Chl-a}_{\text{phy}}^{\text{3D}} = \text{Chl-a}_{\text{phy}}^{\text{2D}} \cdot A \cdot \exp(f^{\text{Light}}(\text{MLD})) \cdot f(\text{ILD})$$
 
 Where:
 - Optical proxy: $C_{\text{opt}} = A \cdot \exp(B \cdot \text{NDCI})$
