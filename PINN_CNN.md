@@ -6,11 +6,11 @@ It consist on implementation of an uncertainty-aware, multi-modal 3D Convolution
 <p align="center">
   <img src="flowshart_CNN.jpg" width="100%">
 </p>
-## Physics-Informed Neural Network (MS-CNN) (Summarized: part_1)
+# Physics-Informed Neural Network (MS-CNN) (Summarized: part_1)
 <p align="center">
   <img src="flowshart_CNN_1.jpg" width="100%">
 </p>
-## Physics-Informed Neural Network (MS-CNN) (Summarized: part_2)
+# Physics-Informed Neural Network (MS-CNN) (Summarized: part_2)
 <p align="center">
   <img src="flowshart_CNN_2.jpg" width="100%">
 </p>
